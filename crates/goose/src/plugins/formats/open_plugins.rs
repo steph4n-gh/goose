@@ -99,8 +99,12 @@ fn install_from_manifest(
     let mut imported_skills = Vec::new();
     for skill in skills {
         let namespaced_name = namespaced_component_name(&plugin_name, &skill.name);
-        let staged_skill_dir = staged_destination.join(&skill.relative_directory);
-        rewrite_skill_name(&staged_skill_dir.join("SKILL.md"), &namespaced_name)?;
+        let relative_skill = skill.relative_directory.join("SKILL.md");
+        rewrite_skill_name(
+            &staged_destination.join(&relative_skill),
+            &namespaced_name,
+            &relative_skill,
+        )?;
         imported_skills.push(ImportedSkill {
             name: namespaced_name,
             directory: destination.join(&skill.relative_directory),
@@ -467,9 +471,25 @@ fn extract_skill_name(raw: &str) -> Option<String> {
     metadata.name.filter(|name| !name.is_empty())
 }
 
-fn rewrite_skill_name(skill_file: &Path, name: &str) -> Result<()> {
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct InvalidSkillFrontmatter {
+    message: String,
+}
+
+fn rewrite_skill_name(skill_file: &Path, name: &str, display_path: &Path) -> Result<()> {
     let raw = fs::read_to_string(skill_file)?;
-    let rewritten = rewrite_skill_content_name(&raw, name)?;
+    let rewritten = match rewrite_skill_content_name(&raw, name) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            let parse_err = err.downcast::<InvalidSkillFrontmatter>()?;
+            bail!(
+                "Failed to parse skill frontmatter in {}: {}",
+                display_path.display(),
+                parse_err.message
+            );
+        }
+    };
     fs::write(skill_file, rewritten)?;
     Ok(())
 }
@@ -488,8 +508,12 @@ fn rewrite_skill_content_name(raw: &str, name: &str) -> Result<String> {
         return Ok(build_skill_md(name, raw));
     }
 
-    let mut metadata = serde_yaml::from_str::<serde_yaml::Mapping>(yaml_content.trim())
-        .unwrap_or_else(|_| serde_yaml::Mapping::new());
+    let mut metadata =
+        serde_yaml::from_str::<serde_yaml::Mapping>(yaml_content.trim()).map_err(|err| {
+            InvalidSkillFrontmatter {
+                message: err.to_string(),
+            }
+        })?;
     metadata.insert(
         serde_yaml::Value::String("name".to_string()),
         serde_yaml::Value::String(name.to_string()),
@@ -844,5 +868,89 @@ mod tests {
         assert!(result.is_err());
         assert!(!install_root.join("failed-plugin").exists());
         assert_eq!(fs::read_dir(&install_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn install_fails_when_skill_frontmatter_is_invalid_yaml() {
+        let install_root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".plugin")).unwrap();
+        fs::write(
+            repo.path().join(".plugin/plugin.json"),
+            r#"{"name":"test-plugin","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let good = repo.path().join("skills").join("audit");
+        fs::create_dir_all(&good).unwrap();
+        fs::write(
+            good.join("SKILL.md"),
+            "---\nname: audit\ndescription: \"Audit code: carefully\"\n---\nDo an audit.",
+        )
+        .unwrap();
+
+        let bad = repo.path().join("skills").join("inspect-image-data");
+        fs::create_dir_all(&bad).unwrap();
+        let original = "---\nname: inspect-image-data\ndescription: Image data quality control via BioIO: LIF/CZI\n---\n\n# test\n";
+        fs::write(bad.join("SKILL.md"), original).unwrap();
+
+        let err = install_from_manifest(
+            "https://example.invalid/repo.git",
+            repo.path(),
+            install_root.path(),
+            &PluginInstallOptions::default(),
+            None,
+        )
+        .unwrap_err();
+
+        let relative = Path::new("skills")
+            .join("inspect-image-data")
+            .join("SKILL.md");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "Failed to parse skill frontmatter in {}",
+                relative.display()
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("mapping values are not allowed"),
+            "{message}"
+        );
+        assert!(!install_root.path().join("test-plugin").exists());
+        assert_eq!(fs::read_to_string(bad.join("SKILL.md")).unwrap(), original);
+    }
+
+    #[test]
+    fn install_keeps_quoted_colon_when_rewriting_skill_name() {
+        let install_root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("plugin.json"),
+            r#"{"name":"test-plugin","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let skill_dir = repo.path().join("skills").join("audit");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: audit\ndescription: \"Audit code: carefully\"\n---\nDo an audit.",
+        )
+        .unwrap();
+
+        let installed = install_from_manifest(
+            "https://example.invalid/repo.git",
+            repo.path(),
+            install_root.path(),
+            &PluginInstallOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let rewritten =
+            fs::read_to_string(installed.directory.join("skills/audit/SKILL.md")).unwrap();
+        assert!(rewritten.contains("name: test-plugin:audit"), "{rewritten}");
+        assert!(rewritten.contains("Audit code: carefully"), "{rewritten}");
     }
 }
