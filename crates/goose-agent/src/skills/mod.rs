@@ -6,7 +6,9 @@ mod arguments;
 mod discovery;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use discovery::{discover_skills, SkillRoot};
+pub use discovery::{
+    discover_skills, discover_skills_with_skipped, SkillDiscovery, SkillRoot, SkippedSkill,
+};
 
 use anyhow::Result;
 use arguments::apply_skill_arguments;

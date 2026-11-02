@@ -51,23 +51,29 @@ fn parse_frontmatter<T: for<'de> Deserialize<'de>>(
     Ok(Some((metadata, body)))
 }
 
+enum ParsedSkill {
+    Skill(SourceEntry),
+    InvalidFrontmatter(String),
+    Skip,
+}
+
 fn parse_skill_content(
     content: &str,
     skill_dir: &Path,
     skill_file: &Path,
     global: bool,
     writable: bool,
-) -> Option<SourceEntry> {
+) -> ParsedSkill {
     let (metadata, body): (Frontmatter, String) = match parse_frontmatter(content) {
         Ok(Some(parsed)) => parsed,
-        Ok(None) => return None,
+        Ok(None) => return ParsedSkill::Skip,
         Err(error) => {
             warn!(
                 "Failed to parse skill frontmatter in {}: {}",
                 skill_file.display(),
                 error
             );
-            return None;
+            return ParsedSkill::InvalidFrontmatter(error.to_string());
         }
     };
 
@@ -78,16 +84,16 @@ fn parse_skill_content(
                 "Skill at '{}' is missing a required 'name' in frontmatter, skipping",
                 skill_dir.display()
             );
-            return None;
+            return ParsedSkill::Skip;
         }
     };
 
     if name.contains('/') {
         warn!("Skill name '{}' contains '/', skipping", name);
-        return None;
+        return ParsedSkill::Skip;
     }
 
-    Some(SourceEntry {
+    ParsedSkill::Skill(SourceEntry {
         source_type: SourceType::Skill,
         name,
         description: metadata.description,
@@ -98,6 +104,11 @@ fn parse_skill_content(
         supporting_files: Vec::new(),
         properties: metadata.metadata,
     })
+}
+
+struct ScannedSkills {
+    skills: Vec<SourceEntry>,
+    skipped: Vec<SkippedSkill>,
 }
 
 fn should_skip_dir(path: &Path) -> bool {
@@ -148,7 +159,7 @@ fn scan_skills_from_dir(
     writable: bool,
     preserve_path: bool,
     seen: &mut HashSet<String>,
-) -> Vec<SourceEntry> {
+) -> ScannedSkills {
     let mut skill_files = Vec::new();
     let mut visited_dirs = HashSet::new();
 
@@ -163,7 +174,8 @@ fn scan_skills_from_dir(
         },
     );
 
-    let mut sources = Vec::new();
+    let mut skills = Vec::new();
+    let mut skipped = Vec::new();
     for skill_file in skill_files {
         let Some(skill_dir) = skill_file.parent() else {
             continue;
@@ -184,41 +196,64 @@ fn scan_skills_from_dir(
             }
         };
 
-        if let Some(mut source) = parse_skill_content(
+        match parse_skill_content(
             &content,
             &registered_skill_dir,
             &skill_file,
             global,
             writable,
         ) {
-            if !seen.contains(&source.name) {
-                let mut files = Vec::new();
-                let mut visited_support_dirs = HashSet::new();
-                walk_files_recursively(
-                    skill_dir,
-                    &mut visited_support_dirs,
-                    &mut |path| !should_skip_dir(path) && !path.join("SKILL.md").is_file(),
-                    &mut |path| {
-                        if path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
-                            if let Ok(relative) = path.strip_prefix(skill_dir) {
-                                files.push(
-                                    registered_skill_dir
-                                        .join(relative)
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                );
+            ParsedSkill::InvalidFrontmatter(error) => {
+                skipped.push(SkippedSkill {
+                    path: skill_file.clone(),
+                    error,
+                });
+            }
+            ParsedSkill::Skip => {}
+            ParsedSkill::Skill(mut source) => {
+                if !seen.contains(&source.name) {
+                    let mut files = Vec::new();
+                    let mut visited_support_dirs = HashSet::new();
+                    walk_files_recursively(
+                        skill_dir,
+                        &mut visited_support_dirs,
+                        &mut |path| !should_skip_dir(path) && !path.join("SKILL.md").is_file(),
+                        &mut |path| {
+                            if path.file_name().and_then(|n| n.to_str()) != Some("SKILL.md") {
+                                if let Ok(relative) = path.strip_prefix(skill_dir) {
+                                    files.push(
+                                        registered_skill_dir
+                                            .join(relative)
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    );
+                                }
                             }
-                        }
-                    },
-                );
-                source.supporting_files = files;
+                        },
+                    );
+                    source.supporting_files = files;
 
-                seen.insert(source.name.clone());
-                sources.push(source);
+                    seen.insert(source.name.clone());
+                    skills.push(source);
+                }
             }
         }
     }
-    sources
+    ScannedSkills { skills, skipped }
+}
+
+/// A `SKILL.md` whose YAML frontmatter failed to parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSkill {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Skills found under the supplied roots, plus frontmatter that failed to parse.
+#[derive(Debug)]
+pub struct SkillDiscovery {
+    pub skills: Vec<SourceEntry>,
+    pub skipped: Vec<SkippedSkill>,
 }
 
 /// Recursively discovers skills from explicit roots, without consulting host configuration.
@@ -230,29 +265,39 @@ fn scan_skills_from_dir(
 ///
 /// Discovery is best-effort: missing or unreadable directories and invalid or
 /// unreadable skills are skipped. Some failures emit tracing warnings; no errors
-/// are returned. An empty result does not distinguish no skills from a failed scan.
+/// are returned. YAML frontmatter that fails to parse is also reported by
+/// [`discover_skills_with_skipped`]. An empty result does not distinguish no
+/// skills from a failed scan.
 ///
 /// Traversal follows file and directory symlinks, including targets outside a
 /// root. Canonical directory identities prevent cycles. `preserve_path` only
 /// affects returned path spelling; discovery is not a confined file-open API.
 /// The caller must enforce access policy when opening returned paths.
 pub fn discover_skills(roots: impl IntoIterator<Item = SkillRoot>) -> Vec<SourceEntry> {
-    let mut sources: Vec<SourceEntry> = Vec::new();
+    discover_skills_with_skipped(roots).skills
+}
+
+/// Same scan as [`discover_skills`], also returning `SKILL.md` files whose YAML
+/// frontmatter failed to parse. Other skips, such as a missing name or an
+/// unreadable file, are still warning-only.
+pub fn discover_skills_with_skipped(roots: impl IntoIterator<Item = SkillRoot>) -> SkillDiscovery {
+    let mut skills = Vec::new();
+    let mut skipped = Vec::new();
     let mut seen = HashSet::new();
 
     for dir in roots {
-        for source in scan_skills_from_dir(
+        let scanned = scan_skills_from_dir(
             &dir.path,
             dir.global,
             dir.writable,
             dir.preserve_path,
             &mut seen,
-        ) {
-            sources.push(source);
-        }
+        );
+        skills.extend(scanned.skills);
+        skipped.extend(scanned.skipped);
     }
 
-    sources
+    SkillDiscovery { skills, skipped }
 }
 
 #[cfg(test)]
@@ -360,12 +405,12 @@ mod tests {
         .unwrap();
 
         let messages = Arc::new(Mutex::new(Vec::new()));
-        let skills = tracing::subscriber::with_default(
+        let discovered = tracing::subscriber::with_default(
             MessageCapture {
                 messages: Arc::clone(&messages),
             },
             || {
-                discover_skills([SkillRoot {
+                discover_skills_with_skipped([SkillRoot {
                     path: root.path().to_path_buf(),
                     global: false,
                     writable: true,
@@ -374,8 +419,17 @@ mod tests {
             },
         );
 
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "ok");
+        assert_eq!(discovered.skills.len(), 1);
+        assert_eq!(discovered.skills[0].name, "ok");
+        assert_eq!(discovered.skipped.len(), 1);
+        assert_eq!(discovered.skipped[0].path, broken_file);
+        assert!(
+            discovered.skipped[0]
+                .error
+                .contains("mapping values are not allowed"),
+            "{}",
+            discovered.skipped[0].error
+        );
         let logged = messages.lock().unwrap().join("\n");
         assert!(
             logged.contains(&format!(

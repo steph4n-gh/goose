@@ -21,6 +21,8 @@ use crate::sources::parse_frontmatter;
 use agent_client_protocol::Error;
 use anyhow::Result;
 use goose_agent::skills::SkillRoot;
+
+pub use goose_agent::skills::SkippedSkill;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use serde::Deserialize;
 use serde_json::Value;
@@ -439,7 +441,17 @@ pub fn discover_skills(working_dir: Option<&Path>) -> Vec<SourceEntry> {
     discover_skills_with_config(working_dir, Config::global())
 }
 
+#[derive(Debug)]
+pub struct InstalledSkills {
+    pub skills: Vec<SourceEntry>,
+    pub skipped: Vec<SkippedSkill>,
+}
+
 fn discover_skills_with_config(working_dir: Option<&Path>, config: &Config) -> Vec<SourceEntry> {
+    discover_installed_skills(working_dir, config).skills
+}
+
+fn discover_installed_skills(working_dir: Option<&Path>, config: &Config) -> InstalledSkills {
     let roots = all_skill_dirs_with_config(working_dir, config)
         .into_iter()
         .map(|dir| SkillRoot {
@@ -448,7 +460,8 @@ fn discover_skills_with_config(working_dir: Option<&Path>, config: &Config) -> V
             writable: dir.writable,
             preserve_path: dir.preserve_path,
         });
-    let mut sources = goose_agent::skills::discover_skills(roots);
+    let discovered = goose_agent::skills::discover_skills_with_skipped(roots);
+    let mut sources = discovered.skills;
     let mut seen: HashSet<_> = sources.iter().map(|source| source.name.clone()).collect();
 
     for content in builtin::get_all() {
@@ -465,10 +478,19 @@ fn discover_skills_with_config(working_dir: Option<&Path>, config: &Config) -> V
         }
     }
 
-    sources
+    InstalledSkills {
+        skills: sources,
+        skipped: discovered.skipped,
+    }
 }
 
 pub fn list_installed_skills(working_dir: Option<&Path>) -> Vec<SourceEntry> {
+    list_installed_skills_with_skipped(working_dir).skills
+}
+
+/// Like [`list_installed_skills`], and also the `SKILL.md` files whose YAML
+/// frontmatter failed to parse.
+pub fn list_installed_skills_with_skipped(working_dir: Option<&Path>) -> InstalledSkills {
     let fallback;
     let wd = match working_dir {
         Some(p) => Some(p),
@@ -477,7 +499,7 @@ pub fn list_installed_skills(working_dir: Option<&Path>) -> Vec<SourceEntry> {
             fallback.as_deref()
         }
     };
-    discover_skills(wd)
+    discover_installed_skills(wd, Config::global())
 }
 
 #[cfg(test)]
