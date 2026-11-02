@@ -46,4 +46,11 @@ fn print_plugin_install(install: &goose::plugins::PluginInstall) {
             println!("    - {}", skill.name);
         }
     }
+
+    if !install.skipped_skills.is_empty() {
+        println!("  Skipped skills:");
+        for skill in &install.skipped_skills {
+            println!("    - {}: {}", skill.path.display(), skill.error);
+        }
+    }
 }
