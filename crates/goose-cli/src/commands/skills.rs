@@ -1,6 +1,6 @@
 use anyhow::Result;
 use console::{measure_text_width, Term};
-use goose::skills::list_installed_skills;
+use goose::skills::{list_installed_skills_with_skipped, SkippedSkill};
 use goose::token_counter::create_token_counter;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -34,7 +34,8 @@ pub async fn handle_skills_list() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let terminal_width = terminal_width();
     let token_counter = create_token_counter().await.map_err(anyhow::Error::msg)?;
-    let mut skills = list_installed_skills(Some(&cwd));
+    let listed = list_installed_skills_with_skipped(Some(&cwd));
+    let mut skills = listed.skills;
     skills.sort_by(|a, b| a.name.cmp(&b.name));
 
     let rows = skills
@@ -53,8 +54,26 @@ pub async fn handle_skills_list() -> Result<()> {
     for row in rows {
         println!("{}", skill_line(&row, &widths, terminal_width));
     }
+    for line in skipped_skill_warnings(&listed.skipped) {
+        eprintln!("{line}");
+    }
 
     Ok(())
+}
+
+fn skipped_skill_warnings(skipped: &[SkippedSkill]) -> Vec<String> {
+    let mut skipped = skipped.to_vec();
+    skipped.sort_by(|left, right| left.path.cmp(&right.path));
+    skipped
+        .into_iter()
+        .map(|skill| {
+            format!(
+                "Failed to parse skill frontmatter in {}: {}",
+                skill.path.display(),
+                skill.error
+            )
+        })
+        .collect()
 }
 
 fn terminal_width() -> Option<usize> {
@@ -233,6 +252,7 @@ fn pad_to_display_width(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn truncate_to_display_width_keeps_grapheme_clusters_intact() {
@@ -245,5 +265,21 @@ mod tests {
     fn truncate_to_display_width_drops_cluster_that_cannot_fit() {
         assert_eq!(truncate_to_display_width("🏳️‍🌈abc", 4), "...");
         assert_eq!(truncate_to_display_width("界界界", 5), "界...");
+    }
+
+    #[test]
+    fn skipped_skill_warning_includes_path_and_parser_error() {
+        let path = Path::new("skills").join("broken").join("SKILL.md");
+        let warnings = skipped_skill_warnings(&[SkippedSkill {
+            path: path.clone(),
+            error: "mapping values are not allowed".to_string(),
+        }]);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Failed to parse skill frontmatter in {}: mapping values are not allowed",
+                path.display()
+            )]
+        );
     }
 }
