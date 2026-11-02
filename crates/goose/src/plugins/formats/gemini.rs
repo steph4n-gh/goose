@@ -81,6 +81,7 @@ pub(in crate::plugins) fn try_install_from_manifest_at_root(
                 directory: destination.join(skill.relative_directory),
             })
             .collect(),
+        skipped_skills: Vec::new(),
     })
 }
 

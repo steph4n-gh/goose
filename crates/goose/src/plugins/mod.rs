@@ -48,6 +48,7 @@ pub struct PluginInstall {
     pub source: String,
     pub directory: PathBuf,
     pub skills: Vec<ImportedSkill>,
+    pub skipped_skills: Vec<SkippedSkill>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +66,14 @@ pub struct PluginAutoUpdateResult {
 pub struct ImportedSkill {
     pub name: String,
     pub directory: PathBuf,
+}
+
+/// A skill left unchanged because its frontmatter did not parse.
+/// `path` is relative to the plugin directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSkill {
+    pub path: PathBuf,
+    pub error: String,
 }
 
 #[derive(Debug, thiserror::Error)]

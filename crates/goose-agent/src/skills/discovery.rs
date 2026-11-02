@@ -53,15 +53,20 @@ fn parse_frontmatter<T: for<'de> Deserialize<'de>>(
 
 fn parse_skill_content(
     content: &str,
-    path: &Path,
+    skill_dir: &Path,
+    skill_file: &Path,
     global: bool,
     writable: bool,
 ) -> Option<SourceEntry> {
     let (metadata, body): (Frontmatter, String) = match parse_frontmatter(content) {
         Ok(Some(parsed)) => parsed,
         Ok(None) => return None,
-        Err(e) => {
-            warn!("Failed to parse skill frontmatter: {}", e);
+        Err(error) => {
+            warn!(
+                "Failed to parse skill frontmatter in {}: {}",
+                skill_file.display(),
+                error
+            );
             return None;
         }
     };
@@ -71,7 +76,7 @@ fn parse_skill_content(
         None => {
             warn!(
                 "Skill at '{}' is missing a required 'name' in frontmatter, skipping",
-                path.display()
+                skill_dir.display()
             );
             return None;
         }
@@ -87,7 +92,7 @@ fn parse_skill_content(
         name,
         description: metadata.description,
         content: body,
-        path: path.to_string_lossy().into_owned(),
+        path: skill_dir.to_string_lossy().into_owned(),
         global,
         writable,
         supporting_files: Vec::new(),
@@ -179,9 +184,13 @@ fn scan_skills_from_dir(
             }
         };
 
-        if let Some(mut source) =
-            parse_skill_content(&content, &registered_skill_dir, global, writable)
-        {
+        if let Some(mut source) = parse_skill_content(
+            &content,
+            &registered_skill_dir,
+            &skill_file,
+            global,
+            writable,
+        ) {
             if !seen.contains(&source.name) {
                 let mut files = Vec::new();
                 let mut visited_support_dirs = HashSet::new();
@@ -244,4 +253,141 @@ pub fn discover_skills(roots: impl IntoIterator<Item = SkillRoot>) -> Vec<Source
     }
 
     sources
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    struct MessageCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct MessageVisitor {
+        message: String,
+    }
+
+    impl Visit for MessageVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    impl Subscriber for MessageCapture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= &tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor {
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            if !visitor.message.is_empty() {
+                self.messages.lock().unwrap().push(visitor.message);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "goose-skill-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn invalid_yaml_frontmatter_warns_with_the_skill_path() {
+        let root = TempDir::new();
+        let broken_dir = root.path().join("broken");
+        std::fs::create_dir(&broken_dir).unwrap();
+        let broken_file = broken_dir.join("SKILL.md");
+        std::fs::write(
+            &broken_file,
+            "---\nname: broken\ndescription: This breaks YAML: colon space here\n---\n# test\n",
+        )
+        .unwrap();
+        let ok_dir = root.path().join("ok");
+        std::fs::create_dir(&ok_dir).unwrap();
+        std::fs::write(
+            ok_dir.join("SKILL.md"),
+            "---\nname: ok\ndescription: Fine\n---\nbody\n",
+        )
+        .unwrap();
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let skills = tracing::subscriber::with_default(
+            MessageCapture {
+                messages: Arc::clone(&messages),
+            },
+            || {
+                discover_skills([SkillRoot {
+                    path: root.path().to_path_buf(),
+                    global: false,
+                    writable: true,
+                    preserve_path: true,
+                }])
+            },
+        );
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "ok");
+        let logged = messages.lock().unwrap().join("\n");
+        assert!(
+            logged.contains(&format!(
+                "Failed to parse skill frontmatter in {}",
+                broken_file.display()
+            )),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("mapping values are not allowed"),
+            "{logged}"
+        );
+        assert!(!logged.contains(&format!("{}", ok_dir.join("SKILL.md").display())));
+    }
 }

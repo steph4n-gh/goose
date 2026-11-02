@@ -2,7 +2,7 @@
 
 use crate::plugins::{
     copy_dir_all, write_install_metadata, FormatNotSupported, ImportedSkill, PluginFormat,
-    PluginInstall, PluginInstallOptions,
+    PluginInstall, PluginInstallOptions, SkippedSkill,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -97,15 +97,26 @@ fn install_from_manifest(
     copy_dir_all(checkout_dir, &staged_destination)?;
 
     let mut imported_skills = Vec::new();
+    let mut skipped_skills = Vec::new();
     for skill in skills {
         let namespaced_name = namespaced_component_name(&plugin_name, &skill.name);
-        let staged_skill_dir = staged_destination.join(&skill.relative_directory);
-        rewrite_skill_name(&staged_skill_dir.join("SKILL.md"), &namespaced_name)?;
-        imported_skills.push(ImportedSkill {
-            name: namespaced_name,
-            directory: destination.join(&skill.relative_directory),
-        });
+        let relative_skill = skill.relative_directory.join("SKILL.md");
+        match rewrite_skill_name(&staged_destination.join(&relative_skill), &namespaced_name)? {
+            SkillNameRewrite::Rewritten => {
+                imported_skills.push(ImportedSkill {
+                    name: namespaced_name,
+                    directory: destination.join(&skill.relative_directory),
+                });
+            }
+            SkillNameRewrite::InvalidFrontmatter(error) => {
+                skipped_skills.push(SkippedSkill {
+                    path: relative_skill,
+                    error,
+                });
+            }
+        }
     }
+    skipped_skills.sort_by(|left, right| left.path.cmp(&right.path));
 
     write_install_metadata(
         &staged_destination,
@@ -125,6 +136,7 @@ fn install_from_manifest(
         source: source.to_string(),
         directory: destination,
         skills: imported_skills,
+        skipped_skills,
     })
 }
 
@@ -467,16 +479,32 @@ fn extract_skill_name(raw: &str) -> Option<String> {
     metadata.name.filter(|name| !name.is_empty())
 }
 
-fn rewrite_skill_name(skill_file: &Path, name: &str) -> Result<()> {
-    let raw = fs::read_to_string(skill_file)?;
-    let rewritten = rewrite_skill_content_name(&raw, name)?;
-    fs::write(skill_file, rewritten)?;
-    Ok(())
+enum SkillNameRewrite {
+    Rewritten,
+    InvalidFrontmatter(String),
 }
 
-fn rewrite_skill_content_name(raw: &str, name: &str) -> Result<String> {
+enum PreparedSkillRewrite {
+    Content(String),
+    InvalidFrontmatter(String),
+}
+
+fn rewrite_skill_name(skill_file: &Path, name: &str) -> Result<SkillNameRewrite> {
+    let raw = fs::read_to_string(skill_file)?;
+    match rewrite_skill_content_name(&raw, name)? {
+        PreparedSkillRewrite::Content(rewritten) => {
+            fs::write(skill_file, rewritten)?;
+            Ok(SkillNameRewrite::Rewritten)
+        }
+        PreparedSkillRewrite::InvalidFrontmatter(error) => {
+            Ok(SkillNameRewrite::InvalidFrontmatter(error))
+        }
+    }
+}
+
+fn rewrite_skill_content_name(raw: &str, name: &str) -> Result<PreparedSkillRewrite> {
     if !raw.trim_start().starts_with("---") {
-        return Ok(build_skill_md(name, raw));
+        return Ok(PreparedSkillRewrite::Content(build_skill_md(name, raw)));
     }
 
     let mut parts = raw.splitn(3, "---");
@@ -485,21 +513,23 @@ fn rewrite_skill_content_name(raw: &str, name: &str) -> Result<String> {
     let body = parts.next().unwrap_or_default();
 
     if !prefix.trim().is_empty() || body.is_empty() {
-        return Ok(build_skill_md(name, raw));
+        return Ok(PreparedSkillRewrite::Content(build_skill_md(name, raw)));
     }
 
-    let mut metadata = serde_yaml::from_str::<serde_yaml::Mapping>(yaml_content.trim())
-        .unwrap_or_else(|_| serde_yaml::Mapping::new());
+    let mut metadata = match serde_yaml::from_str::<serde_yaml::Mapping>(yaml_content.trim()) {
+        Ok(metadata) => metadata,
+        Err(err) => return Ok(PreparedSkillRewrite::InvalidFrontmatter(err.to_string())),
+    };
     metadata.insert(
         serde_yaml::Value::String("name".to_string()),
         serde_yaml::Value::String(name.to_string()),
     );
 
-    Ok(format!(
+    Ok(PreparedSkillRewrite::Content(format!(
         "---\n{}---{}",
         serde_yaml::to_string(&metadata)?,
         body
-    ))
+    )))
 }
 
 fn build_skill_md(name: &str, body: &str) -> String {
@@ -844,5 +874,62 @@ mod tests {
         assert!(result.is_err());
         assert!(!install_root.join("failed-plugin").exists());
         assert_eq!(fs::read_dir(&install_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn install_skips_skill_with_invalid_yaml_frontmatter() {
+        let install_root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".plugin")).unwrap();
+        fs::write(
+            repo.path().join(".plugin/plugin.json"),
+            r#"{"name":"test-plugin","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let good = repo.path().join("skills").join("audit");
+        fs::create_dir_all(&good).unwrap();
+        fs::write(
+            good.join("SKILL.md"),
+            "---\nname: audit\ndescription: \"Audit code: carefully\"\n---\nDo an audit.",
+        )
+        .unwrap();
+
+        let bad = repo.path().join("skills").join("inspect-image-data");
+        fs::create_dir_all(&bad).unwrap();
+        let original = "---\nname: inspect-image-data\ndescription: Image data quality control via BioIO: LIF/CZI\n---\n\n# test\n";
+        fs::write(bad.join("SKILL.md"), original).unwrap();
+
+        let installed = install_from_manifest(
+            "https://example.invalid/repo.git",
+            repo.path(),
+            install_root.path(),
+            &PluginInstallOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let relative = Path::new("skills")
+            .join("inspect-image-data")
+            .join("SKILL.md");
+        assert_eq!(installed.skills.len(), 1);
+        assert_eq!(installed.skills[0].name, "test-plugin:audit");
+        assert_eq!(installed.skipped_skills.len(), 1);
+        assert_eq!(installed.skipped_skills[0].path, relative);
+        assert!(
+            installed.skipped_skills[0]
+                .error
+                .contains("mapping values are not allowed"),
+            "{}",
+            installed.skipped_skills[0].error
+        );
+        assert_eq!(
+            fs::read_to_string(installed.directory.join(&relative)).unwrap(),
+            original
+        );
+        let rewritten =
+            fs::read_to_string(installed.directory.join("skills/audit/SKILL.md")).unwrap();
+        assert!(rewritten.contains("name: test-plugin:audit"), "{rewritten}");
+        assert!(rewritten.contains("Audit code: carefully"), "{rewritten}");
     }
 }
